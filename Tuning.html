@@ -142,6 +142,11 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
   color: var(--green);
   white-space: nowrap;
 }
+.nav-tag.wip {
+  background: rgba(210,153,34,.1);
+  border-color: rgba(210,153,34,.3);
+  color: var(--amber);
+}
 
 /* ── panels ── */
 .panel {
@@ -176,6 +181,7 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
   flex-shrink: 0;
 }
 .badge-live { background: rgba(63,185,80,.1); border: 1px solid rgba(63,185,80,.3); color: var(--green); }
+.badge-wip  { background: rgba(210,153,34,.1); border: 1px solid rgba(210,153,34,.3); color: var(--amber); }
 .page { display: none; flex-direction: column; gap: 20px; }
 .page.active { display: flex; }
 
@@ -324,6 +330,10 @@ input[type=range]::-moz-range-thumb {
       <div class="nav-item" data-page="macros">
         <span class="nav-icon">⌘</span> Macros
         <span class="nav-tag">live</span>
+      </div>
+      <div class="nav-item" data-page="ml">
+        <span class="nav-icon">◎</span> Gesture ML
+        <span class="nav-tag wip">wip</span>
       </div>
     </div>
     <div class="nav-section" style="margin-top:12px;">
@@ -537,6 +547,60 @@ input[type=range]::-moz-range-thumb {
         </div>
         <div id="telemetryBody"><span class="telem-empty">No telemetry yet — add JSON lines to firmware Serial output.</span></div>
         <div class="telem-meta" id="telemetryMeta"></div>
+      </div>
+    </div>
+
+    <!-- ML / GESTURE -->
+    <div class="page" id="page-ml">
+      <div class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Gesture Recognition — ML</span>
+          <span class="badge badge-wip">Not in firmware</span>
+        </div>
+        <p class="section-hint">These controls are reserved for the Edge Impulse gesture classifier — not yet implemented in the current firmware build.</p>
+
+        <div style="border:1px dashed var(--border);border-radius:var(--r);padding:28px 24px;text-align:center;margin-bottom:20px;">
+          <div style="font-family:var(--mono);font-size:32px;color:var(--border);margin-bottom:12px;">◎</div>
+          <div style="font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--amber);margin-bottom:8px;">Work in progress</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.7;max-width:420px;margin:0 auto;">
+            The gesture classifier was abandoned in favour of the clutch-mode button remap design — hardware threshold classification hit a ceiling on 2 axes with 4 gesture types. This tab is a placeholder for when an Edge Impulse trained model gets integrated.
+          </div>
+        </div>
+
+        <div class="grid2" style="opacity:.45;pointer-events:none;">
+          <div class="ctrl">
+            <div class="ctrl-row">
+              <label class="ctrl-label">ML confidence threshold</label>
+              <span class="ctrl-val">92%</span>
+            </div>
+            <input type="range" min="50" max="99" step="1" value="92" disabled>
+            <span class="ctrl-desc">Minimum match certainty before a gesture fires.</span>
+          </div>
+          <div class="ctrl">
+            <div class="ctrl-row">
+              <label class="ctrl-label">Cooldown</label>
+              <span class="ctrl-val">600 ms</span>
+            </div>
+            <input type="range" min="300" max="1500" step="50" value="600" disabled>
+            <span class="ctrl-desc">Minimum gap between two gesture triggers.</span>
+          </div>
+          <div class="ctrl">
+            <div class="ctrl-row">
+              <label class="ctrl-label">Settle window</label>
+              <span class="ctrl-val">150 ms</span>
+            </div>
+            <input type="range" min="50" max="300" step="10" value="150" disabled>
+            <span class="ctrl-desc">Hand must be still this long before a new gesture starts.</span>
+          </div>
+          <div class="ctrl">
+            <div class="ctrl-row">
+              <label class="ctrl-label">Tolerance</label>
+              <span class="ctrl-val">5</span>
+            </div>
+            <input type="range" min="1" max="10" step="1" value="5" disabled>
+            <span class="ctrl-desc">Slack allowed when matching a gesture shape.</span>
+          </div>
+        </div>
       </div>
     </div>
 
