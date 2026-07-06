@@ -508,12 +508,20 @@ input[type=range]::-moz-range-thumb {
         <p class="section-hint">Remap clutch-mode actions without reflashing. Separate keys with <code style="font-family:var(--mono);background:var(--surface2);padding:1px 5px;border-radius:3px;">+</code> — e.g. <code style="font-family:var(--mono);background:var(--surface2);padding:1px 5px;border-radius:3px;">ctrl+z</code>. Modifiers: ctrl, shift, alt, gui/cmd/win. Zoom direction (tilt left/right) is not remappable here.</p>
         <div class="macro-grid">
           <div class="macro-field">
-            <label for="macroUndo">Undo — left click in clutch</label>
+            <label for="macroUndo">Undo — left tap in clutch</label>
             <input type="text" id="macroUndo" value="ctrl+z" placeholder="e.g. ctrl+z">
           </div>
           <div class="macro-field">
-            <label for="macroRedo">Redo — right click in clutch</label>
+            <label for="macroRedo">Redo — right tap in clutch</label>
             <input type="text" id="macroRedo" value="ctrl+y" placeholder="e.g. ctrl+y">
+          </div>
+          <div class="macro-field">
+            <label for="macroSketch">Sketch — left hold in clutch</label>
+            <input type="text" id="macroSketch" value="shift+s" placeholder="e.g. shift+s">
+          </div>
+          <div class="macro-field">
+            <label for="macroExtrude">Extrude — right hold in clutch</label>
+            <input type="text" id="macroExtrude" value="shift+e" placeholder="e.g. shift+e">
           </div>
           <div class="macro-field">
             <label for="macroZoomFit">Zoom to fit — tilt up</label>
@@ -524,7 +532,7 @@ input[type=range]::-moz-range-thumb {
             <input type="text" id="macroViewNormal" value="v+n" placeholder="e.g. v+n">
           </div>
         </div>
-        <p style="margin-top:12px;font-size:11px;color:var(--muted);">On Mac, swap ctrl+y → cmd+shift+z for Redo. Changes apply on next Send.</p>
+        <p style="margin-top:12px;font-size:11px;color:var(--muted);">On Mac, swap ctrl+y → cmd+shift+z for Redo. Hold threshold is 600ms. Changes apply on next Send.</p>
       </div>
     </div>
 
@@ -645,6 +653,7 @@ const els = {
   clutchUpDownThresholdVal: $('clutchUpDownThresholdVal'), clutchUpDownHoldMsVal: $('clutchUpDownHoldMsVal'),
   clutchRollRearmDegVal: $('clutchRollRearmDegVal'),
   macroUndo: $('macroUndo'), macroRedo: $('macroRedo'),
+  macroSketch: $('macroSketch'), macroExtrude: $('macroExtrude'),
   macroZoomFit: $('macroZoomFit'), macroViewNormal: $('macroViewNormal'),
   payloadBox: $('payloadBox'), sendBtn: $('sendBtn'), copyBtn: $('copyBtn'), resetBtn: $('resetBtn'),
   monitor: $('monitor'), clearLogBtn: $('clearLogBtn'),
@@ -657,14 +666,15 @@ const DEFAULTS = {
   zoomTiltDeadzoneDeg:20, zoomTickIntervalMs:250,
   clutchUpDownThreshold:15, clutchUpDownHoldMs:150, clutchRollRearmDeg:5,
   invertClutchRoll:1, invertZoom:1,
-  macroUndo:'ctrl+z', macroRedo:'ctrl+y', macroZoomFit:'f', macroViewNormal:'v+n',
+  macroUndo:'ctrl+z', macroRedo:'ctrl+y', macroSketch:'shift+s', macroExtrude:'shift+e',
+  macroZoomFit:'f', macroViewNormal:'v+n',
 };
 const RANGE_IDS = [
   'sensitivity','deadzoneDeg','smoothingAlpha','maxCursorSpeed',
   'zoomTiltDeadzoneDeg','zoomTickIntervalMs','clutchUpDownThreshold','clutchUpDownHoldMs','clutchRollRearmDeg',
 ];
 const TOGGLE_IDS = ['invertX','invertY','invertClutchRoll','invertZoom'];
-const MACRO_IDS  = ['macroUndo','macroRedo','macroZoomFit','macroViewNormal'];
+const MACRO_IDS  = ['macroUndo','macroRedo','macroSketch','macroExtrude','macroZoomFit','macroViewNormal'];
 
 // ── serial ──
 let port=null, reader=null, keepReading=false, readableStreamClosed=null, connected=false;
@@ -733,7 +743,7 @@ async function connect(){
   if(!('serial' in navigator)){ els.banner.hidden=false; return; }
   try{
     port=await navigator.serial.requestPort();
-    await port.open({baudRate:Number(els.baud.value)});
+    await port.open({baudRate:Number(els.baud.value), dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:4096});
     keepReading=true; setConnected(true);
     log('SYS','Connected at '+els.baud.value+' baud'); readLoop();
   }catch(err){
@@ -749,6 +759,31 @@ async function disconnect(){
   try{if(port) await port.close();}catch(e){}
   setConnected(false); log('SYS','Disconnected');
 }
+
+  async function sendConfig(){
+    if(!port||!port.writable) return;
+    const cfg = currentConfig();
+    const cursor = {
+      sensitivity: cfg.sensitivity, deadzoneDeg: cfg.deadzoneDeg,
+      smoothingAlpha: cfg.smoothingAlpha, maxCursorSpeed: cfg.maxCursorSpeed,
+      invertX: cfg.invertX, invertY: cfg.invertY
+    };
+    const clutch = {
+      zoomTiltDeadzoneDeg: cfg.zoomTiltDeadzoneDeg, zoomTickIntervalMs: cfg.zoomTickIntervalMs,
+      clutchUpDownThreshold: cfg.clutchUpDownThreshold, clutchUpDownHoldMs: cfg.clutchUpDownHoldMs,
+      clutchRollRearmDeg: cfg.clutchRollRearmDeg, invertClutchRoll: cfg.invertClutchRoll,
+      invertZoom: cfg.invertZoom
+    };
+    const macros = {
+      macroUndo: cfg.macroUndo, macroRedo: cfg.macroRedo,
+      macroSketch: cfg.macroSketch, macroExtrude: cfg.macroExtrude,
+      macroZoomFit: cfg.macroZoomFit, macroViewNormal: cfg.macroViewNormal
+    };
+    for(const chunk of [cursor, clutch, macros]){
+      await sendObj(chunk);
+      await new Promise(r => setTimeout(r, 120));
+    }
+  }
 
 async function sendObj(obj){
   if(!port||!port.writable) return;
@@ -799,7 +834,7 @@ RANGE_IDS.forEach(id=>{ els[id].addEventListener('input',()=>{ updateReadouts();
 TOGGLE_IDS.forEach(id=>{ els[id].addEventListener('change',()=>{ refreshPreview(); }); });
 MACRO_IDS.forEach(id=>{ els[id].addEventListener('input',refreshPreview); });
 
-els.sendBtn.addEventListener('click',()=>sendObj(currentConfig()));
+els.sendBtn.addEventListener('click',()=>sendConfig());
 els.copyBtn.addEventListener('click',()=>{
   navigator.clipboard.writeText(els.payloadBox.textContent).then(()=>{
     const o=els.copyBtn.textContent; els.copyBtn.textContent='Copied!';
@@ -834,7 +869,7 @@ window.addEventListener('load',async()=>{
   try{
     const ports=await navigator.serial.getPorts();
     if(ports.length===1){
-      port=ports[0]; await port.open({baudRate:Number(els.baud.value)});
+      port=ports[0]; await port.open({baudRate:Number(els.baud.value), dataBits:8, stopBits:1, parity:'none', flowControl:'none', bufferSize:4096});
       keepReading=true; setConnected(true);
       log('SYS','Reconnected to previously authorized device'); readLoop();
     }
