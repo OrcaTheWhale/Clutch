@@ -1,6 +1,6 @@
 # Clutch-May-change-later-
 
-# The Glove Mouse thing
+# Clutch
 
 A hybrid high-precision 2D/3D Air-Mouse wearable smart glove with an expresssive 3D spatial macro trigger, designed for 3D CAD engineering softwares.
 
