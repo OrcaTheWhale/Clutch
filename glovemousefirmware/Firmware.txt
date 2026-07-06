@@ -1,0 +1,446 @@
+// =============================================================
+//  CAD Glove — Mouse mode + Clutch (button remap, no gestures)
+//
+//  Normal mode (clutch OFF): tilt-to-cursor, D3/D1/D2 are
+//  left-click / right-click / tare, exactly as before.
+//
+//  Clutch mode (tap D7 to toggle ON/OFF): cursor freezes, and:
+//    Tap D3           -> Undo (Ctrl+Z)
+//    Tap D1           -> Redo (Ctrl+Y)
+//    TILT left/right  -> continuous zoom in/out
+//    TILT up/down     -> Zoom to fit ('F') / View normal ('N') — one-shot,
+//                         sustained-hold trigger, re-arms on return to neutral
+//
+//  Tare (D2) is now GLOBAL: hold + reposition + release re-zeros
+//  whichever reference is currently active — cursor home in normal
+//  mode, or the zoom/up-down baseline while clutched.
+//
+//  Zoom safely reuses tilt because cursor tracking is fully off
+//  while clutched — the two can never read the sensor at the same
+//  time, so there's no cross-talk by construction, not by tuning.
+//
+//  Requires: ESP32-BLE-Combo library in lib/ (manual install,
+//  see chat — avoids git/registry issues).
+// =============================================================
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <BleCombo.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+// ---------------- Pin assignments ----------------
+const int PIN_LEFT_CLICK  = D3;
+const int PIN_RIGHT_CLICK = D1;
+const int PIN_TARE        = D2;
+const int PIN_CLUTCH      = D7;   // NEW — hold for clutch/keyboard mode
+
+// ---------------- MPU6050 (index finger) ----------------
+const uint8_t MPU_ADDR         = 0x68;
+const uint8_t REG_PWR_MGMT_1   = 0x6B;
+const uint8_t REG_ACCEL_XOUT_H = 0x3B;
+
+// ---------------- Zoom (tilt while clutched — mutually exclusive with cursor, zero cross-talk) ----------------
+// One scroll tick per interval while tilted past the deadzone — simple,
+// predictable rate instead of continuous accumulation (which made small
+// sensitivity numbers hard to reason about since hold-duration also mattered).
+float zoomTiltDeadzoneDeg = 20.0f;
+unsigned long zoomTickIntervalMs = 250;  // larger = slower zoom, tune this directly
+unsigned long lastZoomTick = 0;
+float clutchTiltBaseline = 0.0f;   // pitch baseline (left/right tilt -> continuous zoom)
+float clutchRollBaseline = 0.0f;   // roll baseline (up/down tilt -> discrete triggers)
+
+// ---------------- Up/down discrete triggers (sustained tilt, not a burst —
+// same reliable pattern as the "palm up" idea, arm/disarm on return to neutral) ----
+float clutchUpDownThreshold = 15.0f;  // degrees from clutch-entry baseline
+unsigned long clutchUpDownHoldMs = 150;
+int invertClutchRoll = 1;  // flip to -1 if up/down come out backwards
+bool clutchRollArmed = true;
+bool clutchRollHoldActive = false;
+unsigned long clutchRollHoldStart = 0;
+int clutchRollPendingDir = 0;
+
+// ---------------- Clutch toggle state ----------------
+bool clutchActive = false;
+
+// ---------------- Tuning ----------------
+float sensitivity        = 0.7f;
+int invertX = 1;
+int invertY = -1;
+float deadzoneDeg        = 3.0f;
+float smoothingAlpha = 0.2f;
+int maxCursorSpeed  = 20;
+const unsigned long sampleMs   = 10;
+const unsigned long debounceMs = 30;
+
+float pitchOffset = 0.0f;
+float rollOffset  = 0.0f;
+float smoothedPitch = 0.0f;
+float smoothedRoll  = 0.0f;
+bool smoothingInitialized = false;
+unsigned long lastSampleTime = 0;
+
+float xRemainder = 0.0f;
+float yRemainder = 0.0f;
+
+// ---------------- Debounce helper ----------------
+struct Button {
+  int pin;
+  bool lastReading;
+  bool stableState;
+  unsigned long lastChangeTime;
+};
+
+Button leftBtn   = { PIN_LEFT_CLICK,  HIGH, HIGH, 0 };
+Button rightBtn  = { PIN_RIGHT_CLICK, HIGH, HIGH, 0 };
+Button tareBtn   = { PIN_TARE,        HIGH, HIGH, 0 };
+Button clutchBtn = { PIN_CLUTCH,      HIGH, HIGH, 0 };
+
+bool leftPressed  = false;
+bool rightPressed = false;
+
+bool updateButtonPressEdge(Button &b, bool &heldOut) {
+  bool reading = digitalRead(b.pin);
+  bool pressEdge = false;
+  if (reading != b.lastReading) b.lastChangeTime = millis();
+  if ((millis() - b.lastChangeTime) > debounceMs && reading != b.stableState) {
+    b.stableState = reading;
+    if (b.stableState == LOW) pressEdge = true;
+  }
+  b.lastReading = reading;
+  heldOut = (b.stableState == LOW);
+  return pressEdge;
+}
+
+bool updateButtonReleaseEdge(Button &b, bool &heldOut) {
+  bool reading = digitalRead(b.pin);
+  bool releaseEdge = false;
+  if (reading != b.lastReading) b.lastChangeTime = millis();
+  if ((millis() - b.lastChangeTime) > debounceMs && reading != b.stableState) {
+    bool wasPressed = (b.stableState == LOW);
+    b.stableState = reading;
+    if (wasPressed && b.stableState == HIGH) releaseEdge = true;
+  }
+  b.lastReading = reading;
+  heldOut = (b.stableState == LOW);
+  return releaseEdge;
+}
+
+// ---------------- MPU6050 raw read (with manual bus recovery) ----------------
+void mpuWake();
+int consecutiveI2CFailures = 0;
+const int MAX_I2C_FAILURES_BEFORE_RESET = 5;
+
+void resetI2CBus() {
+  Wire.end();
+  delay(10);
+  Wire.begin();
+  Wire.setClock(400000);
+  mpuWake();
+  consecutiveI2CFailures = 0;
+}
+
+int16_t readWord(uint8_t highReg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(highReg);
+  uint8_t txStatus = Wire.endTransmission(false);
+  uint8_t received = Wire.requestFrom((int)MPU_ADDR, 2, true);
+  if (txStatus != 0 || received != 2) {
+    consecutiveI2CFailures++;
+    if (consecutiveI2CFailures >= MAX_I2C_FAILURES_BEFORE_RESET) resetI2CBus();
+    return 0;
+  }
+  consecutiveI2CFailures = 0;
+  return (Wire.read() << 8) | Wire.read();
+}
+
+void mpuWake() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+}
+
+void getPitchRoll(float &pitch, float &roll, float &magnitude) {
+  int16_t axRaw = readWord(REG_ACCEL_XOUT_H);
+  int16_t ayRaw = readWord(REG_ACCEL_XOUT_H + 2);
+  int16_t azRaw = readWord(REG_ACCEL_XOUT_H + 4);
+  float ax = axRaw / 16384.0f;
+  float ay = ayRaw / 16384.0f;
+  float az = azRaw / 16384.0f;
+  magnitude = sqrt(ax * ax + ay * ay + az * az);
+  pitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+  roll  = atan2(ay, az) * 180.0f / PI;
+}
+
+// ---------------- Clutch keyboard actions ----------------
+void sendUndo() {
+  Serial.println("Clutch: Undo");
+  Keyboard.press(KEY_LEFT_CTRL);
+  Keyboard.press('z');
+  delay(20);
+  Keyboard.releaseAll();
+}
+
+void sendRedo() {
+  Serial.println("Clutch: Redo");
+  // Windows: Ctrl+Y. If your demo machine is a Mac, change this to
+  // Cmd+Shift+Z: Keyboard.press(KEY_LEFT_GUI); Keyboard.press(KEY_LEFT_SHIFT); Keyboard.press('z');
+  Keyboard.press(KEY_LEFT_CTRL);
+  Keyboard.press('y');
+  delay(20);
+  Keyboard.releaseAll();
+}
+
+void sendZoomFit() {
+  Serial.println("Clutch: Zoom to fit");
+  Keyboard.press('f');
+  delay(20);
+  Keyboard.releaseAll();
+}
+
+void sendViewNormal() {
+  Serial.println("Clutch: View normal");
+  Keyboard.press('v');
+  Keyboard.press('n');
+  delay(20);
+  Keyboard.releaseAll();
+}
+
+// ---------------- Web Serial config receiver ----------------
+// Reads one JSON line at a time over USB Serial and updates any
+// matching tuning variables. Only fields present in the JSON get
+// touched — send just what changed. Example line the website sends:
+// {"sensitivity":0.5,"deadzoneDeg":4}
+void readSerialConfig() {
+  if (!Serial.available()) return;
+
+  String line = Serial.readStringUntil('\n');
+  if (line.length() == 0) return;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    Serial.print("Config JSON error: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  if (doc["sensitivity"].is<float>())            sensitivity = doc["sensitivity"];
+  if (doc["deadzoneDeg"].is<float>())             deadzoneDeg = doc["deadzoneDeg"];
+  if (doc["smoothingAlpha"].is<float>())          smoothingAlpha = doc["smoothingAlpha"];
+  if (doc["maxCursorSpeed"].is<int>())            maxCursorSpeed = doc["maxCursorSpeed"];
+  if (doc["invertX"].is<int>())                   invertX = doc["invertX"];
+  if (doc["invertY"].is<int>())                   invertY = doc["invertY"];
+  if (doc["zoomTiltDeadzoneDeg"].is<float>())     zoomTiltDeadzoneDeg = doc["zoomTiltDeadzoneDeg"];
+  if (doc["zoomTickIntervalMs"].is<unsigned long>()) zoomTickIntervalMs = doc["zoomTickIntervalMs"];
+  if (doc["clutchUpDownThreshold"].is<float>())   clutchUpDownThreshold = doc["clutchUpDownThreshold"];
+  if (doc["clutchUpDownHoldMs"].is<unsigned long>()) clutchUpDownHoldMs = doc["clutchUpDownHoldMs"];
+  if (doc["invertClutchRoll"].is<int>())          invertClutchRoll = doc["invertClutchRoll"];
+
+  Serial.println("Config updated");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  pinMode(PIN_LEFT_CLICK,  INPUT_PULLUP);
+  pinMode(PIN_RIGHT_CLICK, INPUT_PULLUP);
+  pinMode(PIN_TARE,        INPUT_PULLUP);
+  pinMode(PIN_CLUTCH,      INPUT_PULLUP);
+
+  Wire.begin();
+  Wire.setClock(400000);
+  mpuWake();
+
+  delay(50);
+  float initMag;
+  getPitchRoll(pitchOffset, rollOffset, initMag);
+
+  Keyboard.begin();
+  Mouse.begin();
+}
+
+void loop() {
+  unsigned long now = millis();
+  readSerialConfig();
+
+  static unsigned long lastStatusPrint = 0;
+  if (now - lastStatusPrint > 5000) {
+    lastStatusPrint = now;
+    Serial.println("---- Button status ----");
+    Serial.print("LEFT   (D3) raw="); Serial.print(digitalRead(PIN_LEFT_CLICK));
+    Serial.print(" debounced="); Serial.println(leftBtn.stableState);
+    Serial.print("RIGHT  (D1) raw="); Serial.print(digitalRead(PIN_RIGHT_CLICK));
+    Serial.print(" debounced="); Serial.println(rightBtn.stableState);
+    Serial.print("TARE   (D2) raw="); Serial.print(digitalRead(PIN_TARE));
+    Serial.print(" debounced="); Serial.println(tareBtn.stableState);
+    Serial.print("CLUTCH (D7) raw="); Serial.print(digitalRead(PIN_CLUTCH));
+    Serial.print(" debounced="); Serial.print(clutchBtn.stableState);
+    Serial.print(" | Clutch active: "); Serial.println(clutchActive);
+    Serial.print("Keyboard connected: "); Serial.println(Keyboard.isConnected());
+  }
+
+  bool leftHeld, rightHeld, tareHeld, clutchHeldRaw;
+  bool leftPress  = updateButtonPressEdge(leftBtn, leftHeld);
+  bool rightPress = updateButtonPressEdge(rightBtn, rightHeld);
+  bool tareReleaseEdge = updateButtonReleaseEdge(tareBtn, tareHeld);
+  bool clutchPressEdge = updateButtonPressEdge(clutchBtn, clutchHeldRaw);
+
+  if (clutchPressEdge) {
+    clutchActive = !clutchActive;
+    Serial.println(clutchActive ? "Clutch: ON" : "Clutch: OFF");
+    smoothingInitialized = false;  // avoid a stale-smoothing jump when returning to mouse mode
+    if (clutchActive) {
+      float p, r, mag;
+      getPitchRoll(p, r, mag);
+      clutchTiltBaseline = p;   // zero continuous zoom relative to this angle
+      clutchRollBaseline = r;   // zero up/down triggers relative to this angle
+      clutchRollArmed = true;
+      clutchRollHoldActive = false;
+    }
+  }
+
+  // ---------------- CLUTCH MODE ----------------
+  if (clutchActive) {
+    // tare re-zeros the CLUTCH reference (not cursor home) while clutched —
+    // same hold-to-reposition-then-release-to-set pattern as normal mode
+    if (tareReleaseEdge) {
+      float p, r, mag;
+      getPitchRoll(p, r, mag);
+      clutchTiltBaseline = p;
+      clutchRollBaseline = r;
+      clutchRollArmed = true;
+      clutchRollHoldActive = false;
+    }
+    if (tareHeld) {
+      lastSampleTime = now;
+      return;  // freeze zoom/up-down while repositioning, same as normal mode
+    }
+
+    if (leftPress)  sendUndo();
+    if (rightPress) sendRedo();
+
+    float pitch, roll, magnitude;
+    getPitchRoll(pitch, roll, magnitude);
+
+    const float magnitudeTolerance = 0.3f;
+    if (fabs(magnitude - 1.0f) < magnitudeTolerance) {  // skip fast-shake garbage
+      float deltaTilt = pitch - clutchTiltBaseline;
+      float deltaRoll = (roll - clutchRollBaseline) * invertClutchRoll;
+
+      // Only the DOMINANT axis acts this sample — same "which one's bigger"
+      // rule that fixed cross-talk during real gesture testing earlier.
+      // Without this, a pure up/down tilt also nudges pitch enough to fire
+      // continuous zoom at the same time, drowning out the discrete trigger.
+      bool leftRightDominant = fabs(deltaTilt) > fabs(deltaRoll);
+
+      // --- left/right tilt: zoom in/out, one tick per interval while tilted ---
+      if (leftRightDominant && fabs(deltaTilt) > zoomTiltDeadzoneDeg) {
+        if (now - lastZoomTick > zoomTickIntervalMs) {
+          lastZoomTick = now;
+          if (Keyboard.isConnected()) {
+            Mouse.move(0, 0, (deltaTilt > 0) ? 1 : -1);
+          }
+        }
+      }
+
+      // --- up/down tilt: discrete Zoom-to-fit / View-normal, sustained-hold
+      // pattern (like "palm up"), armed/disarmed on return to neutral so it
+      // fires once per deliberate tilt, not repeatedly while held ---
+      if (!leftRightDominant) {
+      if (clutchRollArmed) {
+        if (deltaRoll > clutchUpDownThreshold) {
+          if (!clutchRollHoldActive || clutchRollPendingDir != 1) {
+            clutchRollHoldActive = true;
+            clutchRollHoldStart = now;
+            clutchRollPendingDir = 1;
+          } else if (now - clutchRollHoldStart > clutchUpDownHoldMs) {
+            sendZoomFit();
+            clutchRollArmed = false;
+            clutchRollHoldActive = false;
+          }
+        } else if (deltaRoll < -clutchUpDownThreshold) {
+          if (!clutchRollHoldActive || clutchRollPendingDir != -1) {
+            clutchRollHoldActive = true;
+            clutchRollHoldStart = now;
+            clutchRollPendingDir = -1;
+          } else if (now - clutchRollHoldStart > clutchUpDownHoldMs) {
+            sendViewNormal();
+            clutchRollArmed = false;
+            clutchRollHoldActive = false;
+          }
+        } else {
+          clutchRollHoldActive = false;
+        }
+      } else if (fabs(deltaRoll) < zoomTiltDeadzoneDeg) {
+        clutchRollArmed = true;  // back near neutral — ready to fire again
+      }
+      }
+    }
+
+    lastSampleTime = now;
+    return;
+  }
+
+  // ---------------- NORMAL MODE: mouse clicks + tilt tracking ----------------
+  if (Keyboard.isConnected()) {
+    if (leftHeld && !leftPressed)   { Mouse.press(MOUSE_LEFT);  leftPressed = true; }
+    if (!leftHeld && leftPressed)   { Mouse.release(MOUSE_LEFT); leftPressed = false; }
+    if (rightHeld && !rightPressed) { Mouse.press(MOUSE_RIGHT);  rightPressed = true; }
+    if (!rightHeld && rightPressed) { Mouse.release(MOUSE_RIGHT); rightPressed = false; }
+  }
+
+  if (tareReleaseEdge) {
+    float p, r, mag;
+    getPitchRoll(p, r, mag);
+    pitchOffset = p;
+    rollOffset  = r;
+    smoothingInitialized = false;
+  }
+
+  if (tareHeld) {
+    lastSampleTime = now;
+    return;
+  }
+
+  if (now - lastSampleTime < sampleMs) return;
+  lastSampleTime = now;
+
+  float pitch, roll, magnitude;
+  getPitchRoll(pitch, roll, magnitude);
+
+  const float magnitudeTolerance = 0.3f;
+  if (fabs(magnitude - 1.0f) >= magnitudeTolerance) return;  // fast-shake rejection
+
+  if (!smoothingInitialized) {
+    smoothedPitch = pitch;
+    smoothedRoll  = roll;
+    smoothingInitialized = true;
+  } else {
+    smoothedPitch = smoothingAlpha * pitch + (1 - smoothingAlpha) * smoothedPitch;
+    smoothedRoll  = smoothingAlpha * roll  + (1 - smoothingAlpha) * smoothedRoll;
+  }
+
+  float deltaPitch = smoothedPitch - pitchOffset;
+  float deltaRoll  = smoothedRoll  - rollOffset;
+  if (fabs(deltaPitch) < deadzoneDeg) deltaPitch = 0;
+  if (fabs(deltaRoll)  < deadzoneDeg) deltaRoll  = 0;
+
+  float speedX = deltaPitch * sensitivity * invertX;
+  float speedY = deltaRoll  * sensitivity * invertY;
+  speedX = constrain(speedX, -maxCursorSpeed, maxCursorSpeed);
+  speedY = constrain(speedY, -maxCursorSpeed, maxCursorSpeed);
+
+  xRemainder += speedX;
+  yRemainder += speedY;
+  int moveX = (int)xRemainder;
+  int moveY = (int)yRemainder;
+  xRemainder -= moveX;
+  yRemainder -= moveY;
+
+  if ((moveX != 0 || moveY != 0) && Keyboard.isConnected()) {
+    Mouse.move(moveX, moveY);
+  }
+}
