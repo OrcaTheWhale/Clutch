@@ -1,4 +1,4 @@
-# Clutch-May-change-later-
+# Clutch
 
 ### Section 1: Description and Project Overview
 
